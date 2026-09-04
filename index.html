@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SET Triage Atlas — alert investigation graph</title>
+<style>
+  :root{
+    --bg:#0b0f17; --panel:rgba(20,28,40,.92); --line:#26364a; --text:#e8eef5; --muted:#93a4b8;
+    --root:#7c5cff; --alert:#ff6b6b; --tool:#4f9cff; --entity:#c084fc; --action:#3ddc97; --accent:#4f9cff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--text);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  canvas{position:fixed;inset:0;display:block}
+  .hud{position:fixed;top:16px;left:16px;z-index:5;max-width:340px}
+  .hud h1{margin:0;font-size:18px;letter-spacing:.3px}
+  .hud .sub{color:var(--muted);font-size:12px;margin:2px 0 12px}
+  .scen{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px}
+  .chip{background:rgba(20,28,40,.85);border:1px solid var(--line);color:var(--text);border-radius:999px;
+    padding:6px 11px;font-size:12px;cursor:pointer;transition:.15s;backdrop-filter:blur(4px)}
+  .chip:hover{border-color:var(--accent)}
+  .chip.on{background:var(--alert);border-color:var(--alert);color:#160a0a;font-weight:600}
+  .row{display:flex;gap:7px;flex-wrap:wrap}
+  .mini{background:rgba(20,28,40,.85);border:1px solid var(--line);color:var(--muted);border-radius:8px;
+    padding:5px 10px;font-size:12px;cursor:pointer}
+  .mini:hover{color:var(--text);border-color:var(--accent)}
+  .legend{position:fixed;bottom:14px;left:16px;z-index:5;display:flex;gap:14px;flex-wrap:wrap;
+    background:rgba(11,15,23,.6);padding:8px 12px;border-radius:10px;font-size:12px;color:var(--muted);backdrop-filter:blur(4px)}
+  .legend b{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+  .panel{position:fixed;top:16px;right:16px;z-index:5;width:360px;max-height:calc(100% - 32px);overflow:auto;
+    background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px;backdrop-filter:blur(8px);
+    box-shadow:0 20px 50px rgba(0,0,0,.5);transition:transform .25s, opacity .25s}
+  .panel.hidden{transform:translateX(20px);opacity:0;pointer-events:none}
+  .panel h2{margin:0 0 2px;font-size:16px}
+  .panel .k{color:var(--muted);font-size:12px;margin-bottom:12px}
+  .play{width:100%;background:var(--alert);border:none;color:#160a0a;font-weight:700;border-radius:9px;
+    padding:9px;cursor:pointer;font-size:13px;margin-bottom:12px}
+  .step{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:8px;padding:9px 11px;margin-bottom:8px;transition:.2s}
+  .step.on{border-left-color:var(--action);background:rgba(61,220,151,.08)}
+  .step .ph{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent);font-weight:700}
+  .step .tool{font-size:11px;color:var(--muted);float:right}
+  .step .txt{margin-top:3px}
+  .step code{background:#0c1621;border:1px solid var(--line);padding:1px 5px;border-radius:5px;color:#bcd3ee;font-size:12px}
+  .hint{position:fixed;bottom:14px;right:16px;z-index:5;color:var(--muted);font-size:12px;background:rgba(11,15,23,.6);padding:6px 10px;border-radius:8px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="hud">
+  <h1>SET Triage Atlas</h1>
+  <div class="sub">An Obsidian-style graph of how each security alert is investigated and responded to across the toolset. Pick a scenario, or click any node.</div>
+  <div class="scen" id="scen"></div>
+  <div class="row">
+    <button class="mini" onclick="clearFocus()">Reset view</button>
+    <button class="mini" onclick="toggleSpin()">Toggle drift</button>
+  </div>
+</div>
+
+<div class="panel hidden" id="panel"></div>
+
+<div class="legend" id="legend"></div>
+<div class="hint">drag nodes &middot; hover to highlight &middot; click an alert then <b>Simulate triage</b></div>
+
+<script>
+// ---------- graph data ----------
+const NODES = [
+  {id:"ROOT", label:"SET Triage", type:"root"},
+  {id:"PHISH", label:"Phishing email", type:"alert"},
+  {id:"MAL", label:"Malware detection", type:"alert"},
+  {id:"DLP", label:"Data exfiltration (DLP)", type:"alert"},
+  {id:"BRUTE", label:"Brute force / spray", type:"alert"},
+  {id:"UNAUTH", label:"Unauthorised access", type:"alert"},
+  {id:"HEALTH", label:"Tool unhealthy (Run)", type:"alert"},
+  {id:"SENTINEL", label:"Sentinel (SIEM)", type:"tool"},
+  {id:"DEFENDER", label:"Defender XDR", type:"tool"},
+  {id:"EMAIL", label:"Email Gateway", type:"tool"},
+  {id:"IDPS", label:"IDPS", type:"tool"},
+  {id:"GVM", label:"Greenbone GVM", type:"tool"},
+  {id:"AV", label:"Malware Protection", type:"tool"},
+  {id:"USER", label:"User / identity", type:"entity"},
+  {id:"HOST", label:"Host / endpoint", type:"entity"},
+  {id:"IP", label:"IP / network", type:"entity"},
+  {id:"MAILBOX", label:"Mailbox", type:"entity"},
+  {id:"DATA", label:"Data / file", type:"entity"},
+  {id:"ISOLATE", label:"Isolate host", type:"action"},
+  {id:"RESETCREDS", label:"Reset creds / revoke", type:"action"},
+  {id:"BLOCK", label:"Block sender/URL/IP", type:"action"},
+  {id:"QUARANTINE", label:"Quarantine file", type:"action"},
+  {id:"TUNE", label:"Tune detection rule", type:"action"},
+  {id:"ESCALATE", label:"Escalate to client/IR", type:"action"},
+  {id:"FIXTOOL", label:"Restart connector / fix", type:"action"},
+];
+const LINKS = [
+  ["ROOT","PHISH"],["ROOT","MAL"],["ROOT","DLP"],["ROOT","BRUTE"],["ROOT","UNAUTH"],["ROOT","HEALTH"],
+  ["PHISH","EMAIL"],["PHISH","SENTINEL"],["PHISH","MAILBOX"],["PHISH","USER"],["PHISH","IP"],["PHISH","BLOCK"],["PHISH","RESETCREDS"],["PHISH","TUNE"],["PHISH","ESCALATE"],
+  ["MAL","DEFENDER"],["MAL","AV"],["MAL","SENTINEL"],["MAL","HOST"],["MAL","USER"],["MAL","ISOLATE"],["MAL","QUARANTINE"],["MAL","ESCALATE"],
+  ["DLP","SENTINEL"],["DLP","DEFENDER"],["DLP","EMAIL"],["DLP","USER"],["DLP","DATA"],["DLP","IP"],["DLP","BLOCK"],["DLP","RESETCREDS"],["DLP","TUNE"],["DLP","ESCALATE"],
+  ["BRUTE","SENTINEL"],["BRUTE","USER"],["BRUTE","IP"],["BRUTE","RESETCREDS"],["BRUTE","BLOCK"],["BRUTE","TUNE"],
+  ["UNAUTH","SENTINEL"],["UNAUTH","DEFENDER"],["UNAUTH","USER"],["UNAUTH","HOST"],["UNAUTH","IP"],["UNAUTH","ISOLATE"],["UNAUTH","RESETCREDS"],["UNAUTH","ESCALATE"],
+  ["HEALTH","SENTINEL"],["HEALTH","IDPS"],["HEALTH","GVM"],["HEALTH","AV"],["HEALTH","FIXTOOL"],["HEALTH","ESCALATE"],["HEALTH","TUNE"],
+];
+const PLAY = {
+  PHISH:[
+    {ph:"Detect", node:"EMAIL", tool:"Email Gateway / Sentinel", txt:"Phishing mail to 5+ recipients flagged. <code>EmailEvents | where ThreatTypes has 'Phish'</code>"},
+    {ph:"Triage", node:"MAILBOX", tool:"Email Gateway", txt:"Scope it: how many recipients, did anyone click or reply?"},
+    {ph:"Investigate", node:"SENTINEL", tool:"Sentinel", txt:"Check targeted users' sign-ins for success from a new IP after delivery."},
+    {ph:"Contain", node:"BLOCK", tool:"Email Gateway", txt:"Block sender and URL, soft-delete/purge the campaign from mailboxes."},
+    {ph:"Recover", node:"RESETCREDS", tool:"Entra ID", txt:"Reset credentials and revoke sessions for anyone who interacted."},
+    {ph:"Close", node:"TUNE", tool:"Sentinel", txt:"Tune the rule, note it in the intake queue, update the playbook."},
+  ],
+  MAL:[
+    {ph:"Detect", node:"DEFENDER", tool:"Defender / AV", txt:"High-severity detection. <code>DeviceEvents | where ActionType=='AntivirusDetection'</code>"},
+    {ph:"Triage", node:"HOST", tool:"Defender", txt:"Asset criticality: server vs workstation, and is it spreading?"},
+    {ph:"Investigate", node:"SENTINEL", tool:"Defender timeline", txt:"Review process tree / LOLBins around the detection."},
+    {ph:"Contain", node:"ISOLATE", tool:"Defender", txt:"Isolate the host and quarantine the file."},
+    {ph:"Recover", node:"QUARANTINE", tool:"Defender / AV", txt:"Remediate or re-image, then confirm AV is healthy again."},
+    {ph:"Close", node:"ESCALATE", tool:"SET", txt:"Escalate to the client if material; record and tune."},
+  ],
+  DLP:[
+    {ph:"Detect", node:"SENTINEL", tool:"Sentinel / Netskope", txt:"Large upload to personal cloud or external email with attachments."},
+    {ph:"Triage", node:"DATA", tool:"Purview labels", txt:"Was the data sensitive (labelled)? What is the user's role?"},
+    {ph:"Investigate", node:"USER", tool:"Sentinel", txt:"Correlate downloads, uploads and sign-ins for the user."},
+    {ph:"Contain", node:"BLOCK", tool:"Netskope / Defender", txt:"Block the app or session; reset credentials if account misuse."},
+    {ph:"Recover", node:"ESCALATE", tool:"Data owner", txt:"Engage the data owner, assess impact and notify as required."},
+    {ph:"Close", node:"TUNE", tool:"DLP policy", txt:"Tune the DLP policy to prevent recurrence."},
+  ],
+  BRUTE:[
+    {ph:"Detect", node:"SENTINEL", tool:"Sentinel", txt:"Many failures, few per account, one source = spray."},
+    {ph:"Triage", node:"USER", tool:"Sentinel", txt:"Which accounts, and did any sign-in succeed afterwards?"},
+    {ph:"Investigate", node:"IP", tool:"Sentinel", txt:"Look for success from the same source IP."},
+    {ph:"Contain", node:"BLOCK", tool:"Firewall / Entra", txt:"Block the source IP, reset affected creds, enforce MFA."},
+    {ph:"Close", node:"TUNE", tool:"Sentinel", txt:"Tune the rule and allow-list corporate NAT egress."},
+  ],
+  UNAUTH:[
+    {ph:"Detect", node:"SENTINEL", tool:"Sentinel", txt:"Impossible travel / atypical sign-in for a user."},
+    {ph:"Triage", node:"USER", tool:"Sentinel", txt:"Rule out legitimate travel or VPN egress first."},
+    {ph:"Investigate", node:"HOST", tool:"Defender", txt:"What did the session access? Check host activity."},
+    {ph:"Contain", node:"ISOLATE", tool:"Defender / Entra", txt:"Revoke sessions; isolate the host if compromised."},
+    {ph:"Recover", node:"RESETCREDS", tool:"Entra ID", txt:"Reset credentials and re-enable cleanly."},
+    {ph:"Close", node:"ESCALATE", tool:"SET", txt:"Escalate and tune the detection."},
+  ],
+  HEALTH:[
+    {ph:"Detect", node:"SENTINEL", tool:"Sentinel health", txt:"Connector silent >15m. <code>Usage | summarize max(TimeGenerated) by DataType</code>. Watchtower shows it red."},
+    {ph:"Triage", node:"IDPS", tool:"SET Watchtower", txt:"Which tool, since when, and what are we now blind to?"},
+    {ph:"Investigate", node:"GVM", tool:"Tool console", txt:"Check the service / agent / ingestion pipeline for the tool."},
+    {ph:"Fix", node:"FIXTOOL", tool:"SET", txt:"Restart the connector or service; confirm ingestion resumes."},
+    {ph:"Close", node:"ESCALATE", tool:"ITSM", txt:"Raise an INC, assign ownership in the intake queue, write it up."},
+  ],
+};
+const COLORS = {root:"#7c5cff",alert:"#ff6b6b",tool:"#4f9cff",entity:"#c084fc",action:"#3ddc97"};
+const RAD = {root:18,alert:14,tool:11,entity:10,action:10};
+
+// ---------- setup ----------
+const cv=document.getElementById("c"), ctx=cv.getContext("2d");
+let W,H,DPR;
+function resize(){ DPR=Math.min(2,window.devicePixelRatio||1); W=window.innerWidth; H=window.innerHeight;
+  cv.width=W*DPR; cv.height=H*DPR; cv.style.width=W+"px"; cv.style.height=H+"px";
+  ctx.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener("resize",resize); resize();
+
+const byId={}; NODES.forEach((n,i)=>{ n.x=W/2+Math.cos(i)*180*Math.random()+ (Math.random()-.5)*120;
+  n.y=H/2+Math.sin(i)*180*Math.random()+ (Math.random()-.5)*120; n.vx=0; n.vy=0; byId[n.id]=n; });
+byId.ROOT.x=W/2; byId.ROOT.y=H/2;
+const adj={}; NODES.forEach(n=>adj[n.id]=new Set());
+LINKS.forEach(([a,b])=>{ adj[a].add(b); adj[b].add(a); });
+
+let selected=null, spin=true, hover=null, drag=null;
+let sim=null; // {alert, i, t0, activeNode}
+
+// ---------- physics ----------
+function physics(){
+  for(let i=0;i<NODES.length;i++){ const a=NODES[i];
+    for(let j=i+1;j<NODES.length;j++){ const b=NODES[j];
+      let dx=a.x-b.x, dy=a.y-b.y, d2=dx*dx+dy*dy||1, d=Math.sqrt(d2);
+      const f=Math.min(6, 1500/d2); const ux=dx/d, uy=dy/d;
+      a.vx+=ux*f; a.vy+=uy*f; b.vx-=ux*f; b.vy-=uy*f; }
+  }
+  const scale=Math.min(1, Math.min(W,H)/820); // shrink layout on smaller viewports
+  LINKS.forEach(([ia,ib])=>{ const a=byId[ia], b=byId[ib];
+    let dx=b.x-a.x, dy=b.y-a.y, d=Math.sqrt(dx*dx+dy*dy)||1;
+    const target=((a.type==="root"||b.type==="root")?116:78)*scale;
+    const f=(d-target)*0.02; const ux=dx/d, uy=dy/d;
+    a.vx+=ux*f; a.vy+=uy*f; b.vx-=ux*f; b.vy-=uy*f; });
+  NODES.forEach(n=>{ // centering keeps the constellation compact and on-screen
+    n.vx+=(W/2-n.x)*0.004; n.vy+=(H/2-n.y)*0.004;
+    if(spin && n.type!=="root"){ const ang=0.0004; const cx=W/2, cy=H/2;
+      let dx=n.x-cx, dy=n.y-cy; n.x=cx+dx*Math.cos(ang)-dy*Math.sin(ang); n.y=cy+dx*Math.sin(ang)+dy*Math.cos(ang); }
+    if(n===drag) return;
+    n.vx*=0.82; n.vy*=0.82; n.x+=n.vx; n.y+=n.vy;
+    n.x=Math.max(30,Math.min(W-30,n.x)); n.y=Math.max(30,Math.min(H-30,n.y)); });
+  byId.ROOT.x+=(W/2-byId.ROOT.x)*0.05; byId.ROOT.y+=(H/2-byId.ROOT.y)*0.05;
+}
+
+function neighborhood(id){ const s=new Set([id]); adj[id].forEach(x=>s.add(x)); return s; }
+
+// ---------- draw ----------
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  const focus = selected ? neighborhood(selected) : null;
+  // links
+  LINKS.forEach(([ia,ib])=>{ const a=byId[ia], b=byId[ib];
+    let on = focus ? (focus.has(ia)&&focus.has(ib)) : true;
+    let simEdge = sim && ((ia===sim.alert&&ib===sim.activeNode)||(ib===sim.alert&&ia===sim.activeNode));
+    ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y);
+    ctx.strokeStyle = simEdge ? "rgba(61,220,151,.9)" : on ? "rgba(120,150,190,.28)" : "rgba(120,150,190,.05)";
+    ctx.lineWidth = simEdge ? 2.4 : 1; ctx.stroke(); });
+  // nodes
+  const now=performance.now();
+  NODES.forEach(n=>{
+    let on = focus ? focus.has(n.id) : true;
+    let r=RAD[n.type], col=COLORS[n.type];
+    let alpha = on ? 1 : 0.12;
+    // sim pulse
+    if(sim && n.id===sim.activeNode){ const p=(Math.sin(now/180)+1)/2;
+      ctx.beginPath(); ctx.arc(n.x,n.y,r+6+p*8,0,7); ctx.strokeStyle="rgba(61,220,151,"+(0.5*alpha)+")"; ctx.lineWidth=2; ctx.stroke(); }
+    ctx.globalAlpha=alpha;
+    ctx.beginPath(); ctx.arc(n.x,n.y,r,0,7);
+    const g=ctx.createRadialGradient(n.x,n.y,1,n.x,n.y,r); g.addColorStop(0,col); g.addColorStop(1,col+"22");
+    ctx.fillStyle=g; ctx.fill();
+    ctx.lineWidth = (n.id===selected||n.id===hover)?2.5:1.2;
+    ctx.strokeStyle = (n.id===selected)?"#fff":col; ctx.stroke();
+    // label
+    if(on || n.type==="alert" || n.type==="root"){
+      ctx.globalAlpha = on?1:0.5;
+      ctx.fillStyle="#e8eef5"; ctx.font=(n.type==="root"?"600 13px":"12px")+" -apple-system,Segoe UI,Arial";
+      ctx.textAlign="center"; ctx.fillText(n.label, n.x, n.y+r+13); }
+    ctx.globalAlpha=1;
+  });
+}
+
+function loop(){ physics(); draw(); requestAnimationFrame(loop); }
+loop();
+
+// ---------- interaction ----------
+function nodeAt(mx,my){ let best=null,bd=1e9;
+  NODES.forEach(n=>{ const d=Math.hypot(n.x-mx,n.y-my); if(d<RAD[n.type]+6 && d<bd){bd=d;best=n;} }); return best; }
+cv.addEventListener("mousemove",e=>{ if(drag){ drag.x=e.clientX; drag.y=e.clientY; drag.vx=drag.vy=0; return; }
+  const n=nodeAt(e.clientX,e.clientY); hover=n?n.id:null; cv.style.cursor=n?"pointer":"default"; });
+cv.addEventListener("mousedown",e=>{ const n=nodeAt(e.clientX,e.clientY); if(n) drag=n; });
+window.addEventListener("mouseup",e=>{ if(drag){ const n=nodeAt(e.clientX,e.clientY);
+  if(n===drag){ if(n.type==="alert") selectAlert(n.id); else { selected=n.id; renderNodePanel(n); } } drag=null; } });
+
+// ---------- panel + scenarios ----------
+function selectAlert(id){ selected=id; sim=null; const p=PLAY[id]; const node=byId[id];
+  const panel=document.getElementById("panel"); panel.classList.remove("hidden");
+  panel.innerHTML = `<h2>${node.label}</h2><div class="k">Alert triage playbook &middot; Detect &rarr; Triage &rarr; Respond &rarr; Close</div>
+    <button class="play" onclick="runSim('${id}')">&#9654; Simulate triage</button>
+    <div id="steps">${p.map((s,i)=>stepHtml(s,i)).join("")}</div>`;
+  document.querySelectorAll(".chip").forEach(c=>c.classList.toggle("on",c.dataset.id===id));
+}
+function stepHtml(s,i,on){ return `<div class="step ${on?'on':''}" id="st${i}">
+  <span class="ph">${s.ph}</span><span class="tool">${s.tool}</span><div class="txt">${s.txt}</div></div>`; }
+function renderNodePanel(n){ const uses=[]; for(const k in PLAY){ if(PLAY[k].some(s=>s.node===n.id||k===n.id)) uses.push(k); }
+  const panel=document.getElementById("panel"); panel.classList.remove("hidden");
+  panel.innerHTML=`<h2>${n.label}</h2><div class="k">${n.type}</div>
+    <div class="step">Appears in the triage of: <b>${uses.map(u=>byId[u].label).join(", ")||"—"}</b></div>
+    <div class="k" style="margin-top:10px">Click an alert node (red) to walk its full playbook.</div>`;
+  document.querySelectorAll(".chip").forEach(c=>c.classList.remove("on"));
+}
+function runSim(id){ const p=PLAY[id]; let i=0; selected=id;
+  sim={alert:id, activeNode:p[0].node};
+  const tick=()=>{ if(i>=p.length){ sim=null; document.querySelectorAll(".step").forEach(s=>s.classList.remove("on")); return; }
+    sim.activeNode=p[i].node;
+    document.querySelectorAll(".step").forEach((s,j)=>s.classList.toggle("on",j===i));
+    const el=document.getElementById("st"+i); if(el) el.scrollIntoView({block:"nearest",behavior:"smooth"});
+    i++; sim._to=setTimeout(tick,1500); };
+  tick();
+}
+function clearFocus(){ selected=null; sim=null; document.getElementById("panel").classList.add("hidden");
+  document.querySelectorAll(".chip").forEach(c=>c.classList.remove("on")); }
+function toggleSpin(){ spin=!spin; }
+
+// build scenario chips + legend
+document.getElementById("scen").innerHTML = NODES.filter(n=>n.type==="alert")
+  .map(n=>`<div class="chip" data-id="${n.id}" onclick="selectAlert('${n.id}')">${n.label}</div>`).join("");
+document.getElementById("legend").innerHTML = Object.entries({Alert:"alert",Tool:"tool",Entity:"entity",Action:"action","SET":"root"})
+  .map(([k,t])=>`<span><b style="background:${COLORS[t]}"></b>${k}</span>`).join("");
+</script>
+</body>
+</html>
